@@ -19,7 +19,7 @@ import pytest
 import torch
 from mpi4py import MPI
 
-from flashinfer.comm import MoeAlltoAll
+from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlMemory
 
@@ -832,6 +832,199 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
 def test_moe_a2a_dispatch_moe_combine(distribution, top_k):
     """Test full MoE A2A dispatch + expert processing + combine cycle."""
     safe_run(moe_a2a_dispatch_moe_combine_test_impl, distribution, top_k)
+
+
+def moe_a2a_combine_visibility_stress_test_impl():
+    """Stress one-sided combine visibility with large workspace payloads.
+
+    This test isolates the combine phase. Dispatch is still used to build the
+    compact top-k routing metadata, but the combine payload is a deterministic
+    rank/source/slot/iteration encoding instead of a MoE output. If a peer sees
+    the combine readiness flag before the peer payload writes are visible, the
+    combined value will contain stale data from a previous iteration.
+    """
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    world_size = comm.Get_size()
+    ep_size = world_size
+
+    if ep_size < 2:
+        pytest.skip("combine visibility stress requires at least 2 ranks")
+
+    try:
+        MnnvlMemory.initialize()
+        if not mnnvl_available():
+            pytest.skip(
+                "MNNVL not supported on this system or container lacks SYS_PTRACE capability"
+            )
+    except Exception:
+        pytest.skip("MNNVL not supported on this system")
+
+    node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+    node_local_rank = node_comm.Get_rank()
+    torch.cuda.set_device(node_local_rank)
+
+    check_any_rank_failed()
+
+    top_k = min(8, ep_size)
+    num_experts_per_rank = 8
+    hidden_size = 7168
+    local_num_tokens = 128
+    max_num_tokens = local_num_tokens
+    num_iters = 200
+    dispatch_payload_size_per_token = 2 + top_k * 4 + top_k * 2
+    combine_payload_size_per_token = hidden_size * 4
+
+    mapping = Mapping(
+        rank=rank,
+        moe_ep_size=ep_size,
+        tp_size=ep_size,
+        world_size=ep_size,
+    )
+
+    # Each local token is routed to the next top_k ranks. This ensures every
+    # rank reads remote combine payloads on every iteration.
+    token_selected_experts_cpu = torch.empty(
+        local_num_tokens, top_k, dtype=torch.int32
+    )
+    for token_idx in range(local_num_tokens):
+        for k in range(top_k):
+            target_rank = (rank + token_idx + k) % ep_size
+            token_selected_experts_cpu[token_idx, k] = (
+                target_rank * num_experts_per_rank
+            )
+    token_selected_experts = token_selected_experts_cpu.cuda()
+
+    hidden_states = torch.empty(
+        local_num_tokens, 1, dtype=torch.bfloat16, device="cuda"
+    )
+    topk_weights = torch.ones(
+        local_num_tokens, top_k, dtype=torch.bfloat16, device="cuda"
+    )
+    payloads = [hidden_states, token_selected_experts, topk_weights]
+
+    moe_a2a = MoeAlltoAll(
+        mapping=mapping,
+        max_num_tokens=max_num_tokens,
+        top_k=top_k,
+        num_experts=ep_size * num_experts_per_rank,
+        workspace_size_per_rank=moe_a2a_get_workspace_size_per_rank(
+            ep_size,
+            max_num_tokens,
+            dispatch_payload_size_per_token,
+            combine_payload_size_per_token,
+        ),
+    )
+
+    topk_target_ranks_offset = moe_a2a.metainfo[
+        MoeAlltoAll._METAINFO_INDEX["TOPK_TARGET_RANKS_OFFSET_INDEX"]
+    ].item()
+    topk_send_indices_offset = moe_a2a.metainfo[
+        MoeAlltoAll._METAINFO_INDEX["TOPK_SEND_INDICES_OFFSET_INDEX"]
+    ].item()
+
+    check_any_rank_failed()
+
+    for iteration in range(num_iters):
+        # Keep dispatch payload changing so the compiler/runtime cannot turn
+        # the loop into a degenerate steady-state no-op pattern.
+        hidden_states.fill_(float((iteration % 17) + rank))
+
+        moe_a2a.dispatch(
+            token_selected_experts=token_selected_experts,
+            input_payloads=payloads,
+            runtime_max_tokens_per_rank=max_num_tokens,
+        )
+
+        # Send indices are assigned by parallel atomicAdd in the dispatch
+        # kernel, so expected combine output must use the actual compact
+        # routing metadata written by dispatch.
+        topk_target_ranks = (
+            moe_a2a.workspace[
+                rank,
+                topk_target_ranks_offset : topk_target_ranks_offset
+                + max_num_tokens * top_k * 4,
+            ]
+            .view(torch.int32)
+            .view(max_num_tokens, top_k)
+            .cpu()
+        )
+        topk_send_indices = (
+            moe_a2a.workspace[
+                rank,
+                topk_send_indices_offset : topk_send_indices_offset
+                + max_num_tokens * top_k * 4,
+            ]
+            .view(torch.int32)
+            .view(max_num_tokens, top_k)
+            .cpu()
+        )
+
+        combine_payload = torch.empty(
+            ep_size,
+            max_num_tokens,
+            hidden_size,
+            dtype=torch.float32,
+            device="cuda",
+        )
+
+        # Slot value is exactly representable in float32 because all terms are
+        # multiples of 4096. Different iterations intentionally produce
+        # different values to catch stale workspace reads.
+        recv_source_rank = torch.arange(ep_size, device="cuda", dtype=torch.float32).view(
+            ep_size, 1, 1
+        )
+        slot = torch.arange(
+            max_num_tokens, device="cuda", dtype=torch.float32
+        ).view(1, max_num_tokens, 1)
+        value = (
+            float(iteration + 1) * 1048576.0
+            + float(rank) * 65536.0
+            + recv_source_rank * 8192.0
+            + slot * 4096.0
+        )
+        combine_payload.copy_(value.expand_as(combine_payload))
+
+        combined_output = moe_a2a.combine(
+            payload=combine_payload,
+            runtime_max_tokens_per_rank=max_num_tokens,
+            payload_in_workspace=False,
+        )
+
+        expected = torch.zeros_like(combined_output)
+        for token_idx in range(local_num_tokens):
+            expected_value = 0.0
+            for k in range(top_k):
+                target_rank = int(topk_target_ranks[token_idx, k].item())
+                dst_idx = int(topk_send_indices[token_idx, k].item())
+                if dst_idx < 0:
+                    continue
+
+                expected_value += (
+                    float(iteration + 1) * 1048576.0
+                    + float(target_rank) * 65536.0
+                    + float(rank) * 8192.0
+                    + float(dst_idx) * 4096.0
+                )
+            expected[token_idx].fill_(expected_value)
+
+        if not torch.equal(combined_output, expected):
+            diff = (combined_output.float() - expected.float()).abs()
+            max_diff = diff.max().item()
+            mismatch = (combined_output != expected).nonzero()[0].tolist()
+            raise AssertionError(
+                "combine visibility mismatch "
+                f"rank={rank} iteration={iteration} first_mismatch={mismatch} "
+                f"actual={combined_output[tuple(mismatch)].item()} "
+                f"expected={expected[tuple(mismatch)].item()} max_diff={max_diff}"
+            )
+
+        check_any_rank_failed()
+
+
+def test_moe_a2a_combine_visibility_stress():
+    safe_run(moe_a2a_combine_visibility_stress_test_impl)
 
 
 if __name__ == "__main__":

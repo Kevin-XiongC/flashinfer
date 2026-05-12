@@ -177,6 +177,59 @@ def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
     )
 
 
+@pytest.mark.skipif(
+    not mnnvl_available(),
+    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+)
+def test_moe_alltoall_rejects_runtime_max_smaller_than_local_tokens():
+    """runtime_max_tokens_per_rank is a per-source-rank slot capacity.
+
+    If the local rank dispatches more tokens than this value, the dispatch
+    kernel writes past that source rank's slot range in peer receive buffers.
+    This is a silent-corruption path for callers that derive the runtime max
+    from request batch size while the MoE input has already been expanded into
+    more token rows.
+    """
+
+    torch.cuda.set_device(0)
+    local_num_tokens = 8
+    runtime_max_tokens_per_rank = 4
+    hidden_size = 64
+    top_k = 1
+    num_experts = 1
+
+    hidden_states = torch.randn(
+        local_num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda"
+    )
+    token_selected_experts = torch.zeros(
+        local_num_tokens, top_k, dtype=torch.int32, device="cuda"
+    )
+    input_tensors = [hidden_states, token_selected_experts]
+
+    payload_size_per_token = sum(t[0].numel() * t.itemsize for t in input_tensors)
+    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+        1,
+        local_num_tokens,
+        payload_size_per_token,
+        hidden_size * hidden_states.itemsize,
+    )
+    mapping = Mapping(rank=0, world_size=1)
+    moe_a2a = trtllm_moe_alltoall.MoeAlltoAll(
+        mapping,
+        local_num_tokens,
+        top_k,
+        num_experts,
+        workspace_size_per_rank=workspace_size,
+    )
+
+    with pytest.raises(Exception, match="exceeds runtime_max_tokens_per_rank"):
+        moe_a2a.dispatch(
+            token_selected_experts,
+            input_tensors,
+            runtime_max_tokens_per_rank,
+        )
+
+
 def dispatch_from_single_rank(
     input_tensors,
     token_selected_experts,

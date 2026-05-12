@@ -134,6 +134,9 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
 
   auto localNumTokens = static_cast<int>(tokenSelectedExperts.size(0));
   TVM_FFI_ICHECK(localNumTokens >= 0) << "local_num_tokens must be non-negative";
+  TVM_FFI_ICHECK(localNumTokens <= runtimeMaxTokensPerRank)
+      << "local_num_tokens (" << localNumTokens << ") exceeds runtime_max_tokens_per_rank ("
+      << runtimeMaxTokensPerRank << ")";
 
   // Validate all payloads and calculate sizes
   for (int i = 0; i < numPayloads; ++i) {

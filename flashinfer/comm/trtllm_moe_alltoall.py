@@ -618,6 +618,10 @@ class MoeAlltoAll:
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
             "runtime_max_tokens_per_rank exceeds max_num_tokens"
         )
+        assert token_selected_experts.size(0) <= runtime_max_tokens_per_rank, (
+            f"local_num_tokens ({token_selected_experts.size(0)}) exceeds "
+            f"runtime_max_tokens_per_rank ({runtime_max_tokens_per_rank})"
+        )
 
         recv_tensors, combine_payload_offset = moe_a2a_dispatch(
             token_selected_experts,
